@@ -149,7 +149,8 @@ class NavCMTAgent:
         ddp_kwargs = {
             'device_ids': [self.device.index],
             'output_device': self.device.index,
-            'find_unused_parameters': True,
+            'find_unused_parameters': False,
+            'broadcast_buffers': False,
         }
         self.lang_model = DDP(self.lang_model, **ddp_kwargs)
         self.vision_model = DDP(self.vision_model, **ddp_kwargs)
