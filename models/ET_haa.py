@@ -138,7 +138,7 @@ class ET(nn.Module):
 
         # embed frames and direiction (1,49) --> 768
         im_feature = inputs["frames"]
-        att_frame_feature = torch.zeros((im_feature.shape[0],0,49)).cuda()
+        att_frame_feature = im_feature.new_zeros((im_feature.shape[0], 0, 49))
         for i in range(im_feature.shape[1]):
             att_single_frame_feature, beta = self.attention_layer_vision(inputs["lang_cls"], im_feature[:,i,:,:])       
             att_frame_feature = torch.concat((att_frame_feature, att_single_frame_feature.unsqueeze(1)), axis = 1)

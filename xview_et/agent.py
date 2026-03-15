@@ -22,6 +22,7 @@ from models.dark_net import Darknet
 from models.ET_haa import ET
 from models.vln_model import CustomBERTModel
 from transformers import BertTokenizerFast
+from utils.distributed import all_gather, merge_dist_results
 from utils.logger import print_progress
 
 
@@ -88,6 +89,29 @@ def extract_intersection_coords(geometry):
     return coords
 
 
+class NavigationModel(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.lang_model = CustomBERTModel()
+        self.vision_model = Darknet(args.darknet_model_file, 224)
+        self.vln_model = ET(args)
+
+    def forward(self, mode, **kwargs):
+        if mode == 'language':
+            return self.lang_model(kwargs['input_ids'], kwargs['attention_mask'])
+        if mode == 'vision':
+            return self.vision_model(kwargs['images'])
+        if mode == 'navigation':
+            return self.vln_model(
+                directions=kwargs['directions'],
+                frames=kwargs['frames'],
+                lenths=kwargs['lenths'],
+                lang=kwargs['lang'],
+                lang_cls=kwargs['lang_cls'],
+            )
+        raise ValueError(f'Unsupported navigation mode: {mode}')
+
+
 class NavCMTAgent:
     def __init__(self, args, rank=0):
         self.results = {}
@@ -111,19 +135,16 @@ class NavCMTAgent:
         self.default_gpu = is_default_gpu(self.args)
 
         self.tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
-        self.lang_model = CustomBERTModel().to(self.device)
         self.img_tensor = transforms.ToTensor()
-
-        self.vision_model = Darknet(self.args.darknet_model_file, 224).to(self.device)
+        self.model = NavigationModel(self.args).to(self.device)
         new_state = torch.load(self.args.darknet_weight_file, map_location='cpu')
-        state = self.vision_model.state_dict()
+        state = self._module().vision_model.state_dict()
         model_keys = set(state.keys())
         state_dict = {k: v for k, v in new_state['model'].items() if k in model_keys}
         state.update(state_dict)
-        self.vision_model.load_state_dict(state)
-
-        self.vln_model = ET(self.args).to(self.device)
+        self._module().vision_model.load_state_dict(state)
         self._maybe_wrap_ddp()
+        model_module = self._module()
 
         optimizer_map = {
             'adam': torch.optim.Adam,
@@ -132,10 +153,10 @@ class NavCMTAgent:
             'sgd': torch.optim.SGD,
         }
         optimizer_cls = optimizer_map[args.optim]
-        self.et_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, self.vln_model.parameters()), lr=args.lr)
-        self.lang_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, self.lang_model.parameters()), lr=args.lr)
-        self.vision_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, self.vision_model.parameters()), lr=args.lr)
-        self.rl_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, self.vln_model.parameters()), lr=args.rl_lr)
+        self.et_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vln_model.parameters()), lr=args.lr)
+        self.lang_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.lang_model.parameters()), lr=args.lr)
+        self.vision_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vision_model.parameters()), lr=args.lr)
+        self.rl_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vln_model.parameters()), lr=args.rl_lr)
 
         self.progress_regression = nn.MSELoss(reduction='sum')
         self.stop_criterion = nn.BCEWithLogitsLoss(reduction='sum')
@@ -149,15 +170,22 @@ class NavCMTAgent:
         ddp_kwargs = {
             'device_ids': [self.device.index],
             'output_device': self.device.index,
-            'find_unused_parameters': False,
+            'find_unused_parameters': True,
             'broadcast_buffers': False,
         }
-        self.lang_model = DDP(self.lang_model, **ddp_kwargs)
-        self.vision_model = DDP(self.vision_model, **ddp_kwargs)
-        self.vln_model = DDP(self.vln_model, **ddp_kwargs)
+        self.model = DDP(self.model, **ddp_kwargs)
 
     def _unwrap(self, model):
         return model.module if isinstance(model, DDP) else model
+
+    def _module(self):
+        return self._unwrap(self.model)
+
+    def _set_requires_grad(self, module_names, requires_grad):
+        model_module = self._module()
+        for module_name in module_names:
+            for param in getattr(model_module, module_name).parameters():
+                param.requires_grad_(requires_grad)
 
     def get_results(self):
         return self.results
@@ -166,9 +194,7 @@ class NavCMTAgent:
         self.feedback = feedback
         self.env_name = env_name
 
-        self.vln_model.eval()
-        self.lang_model.eval()
-        self.vision_model.eval()
+        self.model.eval()
 
         self.losses = []
         self.results = {}
@@ -180,9 +206,7 @@ class NavCMTAgent:
 
     def train(self, loader, n_epochs, feedback='student', nss_w_weighting=1, **kwargs):
         self.feedback = feedback
-        self.lang_model.train()
-        self.vln_model.train()
-        self.vision_model.train()
+        self.model.train()
         self.losses = []
 
         for epoch in range(1, n_epochs + 1):
@@ -204,7 +228,7 @@ class NavCMTAgent:
                     raise ValueError('Unsupported feedback mode: %s' % feedback)
 
                 self.loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.vln_model.parameters(), 40.)
+                torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 40.)
                 self.lang_model_optimizer.step()
                 self.vision_model_optimizer.step()
                 self.et_optimizer.step()
@@ -217,9 +241,7 @@ class NavCMTAgent:
             return
 
         self.feedback = 'student'
-        self.lang_model.eval()
-        self.vision_model.eval()
-        self.vln_model.eval()
+        self.model.eval()
 
         updates = 0
         while updates < n_iters:
@@ -235,7 +257,7 @@ class NavCMTAgent:
                 if collected_episodes < self.args.ppo_batch_episodes:
                     continue
 
-                self._run_ppo_update(collected)
+                self._run_ppo_update(self._gather_transitions(collected))
                 collected = []
                 collected_episodes = 0
                 updates += 1
@@ -243,8 +265,13 @@ class NavCMTAgent:
                     break
 
             if collected and updates < n_iters:
-                self._run_ppo_update(collected)
+                self._run_ppo_update(self._gather_transitions(collected))
                 updates += 1
+
+    def _gather_transitions(self, transitions):
+        if self.args.world_size <= 1:
+            return transitions
+        return merge_dist_results(all_gather(transitions))
 
     def _run_ppo_update(self, transitions):
         ppo_stats = self.update_ppo(transitions)
@@ -407,18 +434,20 @@ class NavCMTAgent:
     def prepare_language_features(self, obs):
         lang_inputs = ['' if self.args.vision_only else ob['instructions'] for ob in obs]
         encoding = self.tokenizer(lang_inputs, padding=True, return_tensors='pt')
-        lang_features, linear_cls, _ = self.lang_model(
-            encoding['input_ids'].to(self.device),
-            encoding['attention_mask'].to(self.device)
+        lang_features, linear_cls, _ = self.model(
+            mode='language',
+            input_ids=encoding['input_ids'].to(self.device),
+            attention_mask=encoding['attention_mask'].to(self.device),
         )
 
         dialog_inputs = list(lang_inputs)
         if not self.args.train_val_on_full:
             dialog_inputs = [ob['pre_dialogs'] + ob['instructions'] for ob in obs]
             encoding = self.tokenizer(dialog_inputs, padding=True, return_tensors='pt')
-            _, linear_cls, _ = self.lang_model(
-                encoding['input_ids'].to(self.device),
-                encoding['attention_mask'].to(self.device)
+            _, linear_cls, _ = self.model(
+                mode='language',
+                input_ids=encoding['input_ids'].to(self.device),
+                attention_mask=encoding['attention_mask'].to(self.device),
             )
         return lang_features, linear_cls, dialog_inputs
 
@@ -447,7 +476,7 @@ class NavCMTAgent:
         images = np.ascontiguousarray(images, dtype=np.float32)
         images -= self.rgb_mean
         images /= self.rgb_std
-        im_feature = self.vision_model(torch.from_numpy(images).to(self.device))
+        im_feature = self.model(mode='vision', images=torch.from_numpy(images).to(self.device))
         return im_feature.view(im_feature.size(0), im_feature.size(1), -1)
 
     def append_step_inputs(self, rollout_inputs, im_feature, direction_t, ended):
@@ -470,7 +499,8 @@ class NavCMTAgent:
         return rollout_inputs
 
     def forward_navigation(self, rollout_inputs):
-        model_out, pred_saliency = self.vln_model(
+        model_out, pred_saliency = self.model(
+            mode='navigation',
             directions=rollout_inputs['directions'],
             frames=rollout_inputs['frames'],
             lenths=rollout_inputs['lenths'],
@@ -624,7 +654,8 @@ class NavCMTAgent:
         return self.normalize_waypoint(action_np[:, :2]), self.clip_altitude(action_np[:, 2])
 
     def recompute_policy_metrics(self, transition):
-        model_out, _ = self.vln_model(
+        model_out, _ = self.model(
+            mode='navigation',
             directions=transition['directions'].to(self.device),
             frames=transition['frames'].to(self.device),
             lenths=transition['lenths'],
@@ -887,7 +918,7 @@ class NavCMTAgent:
         indices = np.arange(len(transitions))
         minibatch_size = min(self.args.ppo_minibatch_size, len(transitions))
 
-        self.vln_model.eval()
+        self.model.eval()
         for _ in range(self.args.ppo_epochs):
             np.random.shuffle(indices)
             for start in range(0, len(indices), minibatch_size):
@@ -916,7 +947,7 @@ class NavCMTAgent:
 
                 total_loss = total_loss / max(len(batch_idx), 1)
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.vln_model.parameters(), 10.)
+                torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 10.)
                 self.rl_optimizer.step()
 
                 stats['ppo_loss'].append(float(total_loss.detach().item()))
@@ -935,39 +966,43 @@ class NavCMTAgent:
         self.loss = 0
         current_feedback = self.feedback
         self.feedback = 'teacher'
-        self.rollout(train_ml=self.args.ppo_il_w, train_rl=False, nss_w=0)
-        self.loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.vln_model.parameters(), 10.)
-        self.rl_optimizer.step()
-        self.lang_model_optimizer.zero_grad()
-        self.vision_model_optimizer.zero_grad()
-        self.feedback = current_feedback
+        self._set_requires_grad(('lang_model', 'vision_model'), False)
+        try:
+            self.rollout(train_ml=self.args.ppo_il_w, train_rl=False, nss_w=0)
+            self.loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 10.)
+            self.rl_optimizer.step()
+        finally:
+            self._set_requires_grad(('lang_model', 'vision_model'), True)
+            self.lang_model_optimizer.zero_grad()
+            self.vision_model_optimizer.zero_grad()
+            self.feedback = current_feedback
         return {'ppo_il_anchor': float(self.loss.detach().item()) if not isinstance(self.loss, int) else 0.0}
 
     def save(self, epoch, path):
         the_dir, _ = os.path.split(path)
         os.makedirs(the_dir, exist_ok=True)
         states = {}
+        model_module = self._module()
 
         def create_state(name, model, optimizer):
-            model = self._unwrap(model)
             states[name] = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
             }
 
-        create_state('lang_model', self.lang_model, self.lang_model_optimizer)
-        create_state('vision_model', self.vision_model, self.vision_model_optimizer)
-        create_state('vln_model', self.vln_model, self.et_optimizer)
+        create_state('lang_model', model_module.lang_model, self.lang_model_optimizer)
+        create_state('vision_model', model_module.vision_model, self.vision_model_optimizer)
+        create_state('vln_model', model_module.vln_model, self.et_optimizer)
         states['rl_optimizer'] = {'epoch': epoch + 1, 'optimizer': self.rl_optimizer.state_dict()}
         torch.save(states, path)
 
     def load(self, path):
         states = torch.load(path, map_location='cpu')
+        model_module = self._module()
 
         def recover_state(name, model, optimizer):
-            model = self._unwrap(model)
             state = model.state_dict()
             model_keys = set(state.keys())
             if name in states:
@@ -986,9 +1021,9 @@ class NavCMTAgent:
             count_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print('Model parameters: ', count_parameters)
 
-        recover_state('lang_model', self.lang_model, self.lang_model_optimizer)
-        recover_state('vision_model', self.vision_model, self.vision_model_optimizer)
-        recover_state('vln_model', self.vln_model, self.et_optimizer)
+        recover_state('lang_model', model_module.lang_model, self.lang_model_optimizer)
+        recover_state('vision_model', model_module.vision_model, self.vision_model_optimizer)
+        recover_state('vln_model', model_module.vln_model, self.et_optimizer)
 
         if self.args.resume_optimizer and 'rl_optimizer' in states and 'optimizer' in states['rl_optimizer']:
             self.rl_optimizer.load_state_dict(states['rl_optimizer']['optimizer'])

@@ -102,18 +102,17 @@ class YOLOLayer(nn.Module):
         self.anchor_h = self.scaled_anchors[:, 1:2].view((1, nA, 1, 1))
 
     def forward(self, p, targets=None, requestPrecision=False, weight=None, epoch=None):
-        FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
-        device = torch.device('cuda:4' if p.is_cuda else 'cpu')
-        # weight = xview_class_weights(range(60)).cuda()
+        device = p.device
 
         bs = p.shape[0]
         nG = p.shape[2]
         stride = self.img_dim / nG
 
-        if p.is_cuda and not self.grid_x.is_cuda:
-            self.grid_x, self.grid_y = self.grid_x.cuda(), self.grid_y.cuda()
-            self.anchor_w, self.anchor_h = self.anchor_w.cuda(), self.anchor_h.cuda()
-            # self.scaled_anchors = self.scaled_anchors.cuda()
+        if self.grid_x.device != device:
+            self.grid_x = self.grid_x.to(device)
+            self.grid_y = self.grid_y.to(device)
+            self.anchor_w = self.anchor_w.to(device)
+            self.anchor_h = self.anchor_h.to(device)
 
         # x.view(4, 650, 19, 19) -- > (4, 10, 19, 19, 65)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.nA, self.bbox_attrs, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
@@ -127,7 +126,7 @@ class YOLOLayer(nn.Module):
         height = ((h.data * 2) ** 2) * self.anchor_h
 
         # Add offset and scale with anchors (in grid space, i.e. 0-13)
-        pred_boxes = FT(p[..., :4].shape)
+        pred_boxes = torch.empty_like(p[..., :4])
         pred_conf = p[..., 4]  # Conf
         pred_cls = p[..., 5:]  # Class
 
@@ -153,8 +152,13 @@ class YOLOLayer(nn.Module):
                 build_targets(pred_boxes, pred_conf, pred_cls, targets, self.scaled_anchors, self.nA, self.nC, nG,
                               requestPrecision)
             tcls = tcls[mask.bool()]
-            if x.is_cuda:
-                tx, ty, tw, th, mask, tcls = tx.cuda(), ty.cuda(), tw.cuda(), th.cuda(), mask.cuda(), tcls.cuda()
+            if tx.device != device:
+                tx = tx.to(device)
+                ty = ty.to(device)
+                tw = tw.to(device)
+                th = th.to(device)
+                mask = mask.to(device)
+                tcls = tcls.to(device)
 
             # Mask outputs to ignore non-existing objects (but keep confidence predictions)
             nM = mask.sum().float()
@@ -171,7 +175,8 @@ class YOLOLayer(nn.Module):
                 lcls = nM * CrossEntropyLoss(pred_cls[mask.bool()], torch.argmax(tcls, 1))  # * min(epoch*.01 + 0.125, 1)
                 # lcls = BCEWithLogitsLoss2(pred_cls[mask], tcls.float())
             else:
-                lx, ly, lw, lh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
+                zero = x.new_tensor([0.0])
+                lx, ly, lw, lh, lcls, lconf = zero, zero, zero, zero, zero, zero
 
             lconf += nM * BCEWithLogitsLoss0(pred_conf[~mask.bool()], mask[~mask.bool()].float())
 

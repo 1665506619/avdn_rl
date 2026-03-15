@@ -2,6 +2,7 @@ import os
 import json
 import time
 import copy
+import math
 import numpy as np
 from collections import defaultdict
 
@@ -179,7 +180,7 @@ def train(args, train_env, train_full_traj_env, val_envs, val_full_traj_envs, au
                 parts.append(f"{key} {value:.4f}")
         return ', '.join(parts)
 
-    interval = int(train_env.size()/args.batch_size) * args.log_every
+    interval = max(int(math.ceil(train_env.size() / float(args.batch_size))), 1) * args.log_every
 
     zero_start_iter = 0
     for idx in range(start_iter, start_iter+args.iters, interval):
@@ -283,6 +284,8 @@ def train(args, train_env, train_full_traj_env, val_envs, val_full_traj_envs, au
             agent.env = train_env
         loader = torch.utils.data.DataLoader(agent.env, batch_size=1)
         agent.train_ppo(loader, args.ppo_iters)
+        if args.world_size > 1:
+            dist.barrier()
         ppo_step = start_iter + args.iters + args.ppo_iters
         if default_gpu:
             write_to_record_file('\n' + log_agent_losses(agent, ppo_step, 'PPO stage'), record_file)
@@ -306,6 +309,8 @@ def train(args, train_env, train_full_traj_env, val_envs, val_full_traj_envs, au
                     if writer is not None:
                         writer.add_scalar('%s/%s_ppo' % (metric, env_name), score_summary[metric], ppo_step)
             write_to_record_file(ppo_loss_str, record_file)
+        if args.world_size > 1:
+            dist.barrier()
 
 
 def valid(args, val_envs,  val_full_traj_envs, rank=-1):
@@ -352,8 +357,8 @@ def main():
     if args.world_size > 1:
         if args.local_rank == -1 and os.environ.get("LOCAL_RANK", "") != "":
             args.local_rank = int(os.environ["LOCAL_RANK"])
-        rank = init_distributed(args)
         torch.cuda.set_device(args.local_rank)
+        rank = init_distributed(args)
     else:
         rank = 0
     if args.vision_only:

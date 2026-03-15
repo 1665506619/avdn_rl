@@ -1,5 +1,6 @@
 import json
 import os
+import math
 import numpy as np
 import random
 from collections import defaultdict
@@ -176,7 +177,14 @@ class ANDHNavBatch(torch.utils.data.IterableDataset):
         random.seed(self.seed)
         random.shuffle(self.data)
         if self.world_size > 1:
-            self.data = self.data[self.rank::self.world_size]
+            per_rank = int(math.ceil(len(self.data) / float(self.world_size))) if self.data else 0
+            padded_size = per_rank * self.world_size
+            if self.data and padded_size > len(self.data):
+                for i in range(padded_size - len(self.data)):
+                    self.data.append(self.data[i % len(self.data)])
+            start = self.rank * per_rank
+            end = start + per_rank
+            self.data = self.data[start:end]
 
         self.ix = 0
         self.batch_size = batch_size
@@ -477,4 +485,3 @@ class ANDHNavBatch(torch.utils.data.IterableDataset):
             avg_metrics['gp_else']=np.mean(metrics['gp_else'])
         
         return avg_metrics, metrics
-
