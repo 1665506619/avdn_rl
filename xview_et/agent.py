@@ -77,8 +77,10 @@ def get_direction(start, end):
 def extract_intersection_coords(geometry):
     if geometry is None or geometry.is_empty:
         return []
-    if hasattr(geometry, 'coords'):
+    try:
         return list(geometry.coords)
+    except (NotImplementedError, AttributeError):
+        pass
     coords = []
     if hasattr(geometry, 'geoms'):
         for geom in geometry.geoms:
