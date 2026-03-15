@@ -3,7 +3,6 @@ Distributed tools
 """
 import os
 from pathlib import Path
-from pprint import pformat
 import pickle
 
 import torch
@@ -14,6 +13,19 @@ def load_init_param(opts):
     """
     Load parameters for the rendezvous distributed procedure
     """
+    use_torchrun_env = all(
+        os.environ.get(key, "") != ""
+        for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+    )
+
+    if use_torchrun_env:
+        return {
+            "backend": "nccl",
+            "init_method": "env://",
+            "rank": int(os.environ["RANK"]),
+            "world_size": int(os.environ["WORLD_SIZE"]),
+        }
+
     # sync file
     if opts.output_dir != "":
         sync_dir = Path(opts.output_dir).resolve()
