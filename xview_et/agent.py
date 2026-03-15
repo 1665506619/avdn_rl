@@ -98,7 +98,13 @@ class NavCMTAgent:
         self.feedback = 'student'
         self.rank = rank
         random.seed(1)
-        self.device = torch.device('cuda', self.args.local_rank if self.args.local_rank != -1 else 0)
+        if self.args.local_rank != -1:
+            device_index = self.args.local_rank
+        elif torch.cuda.is_available():
+            device_index = torch.cuda.current_device()
+        else:
+            device_index = 0
+        self.device = torch.device('cuda', device_index)
 
         self.rgb_mean = np.array([60.134, 49.697, 40.746], dtype=np.float32).reshape((3, 1, 1))
         self.rgb_std = np.array([29.99, 24.498, 22.046], dtype=np.float32).reshape((3, 1, 1))

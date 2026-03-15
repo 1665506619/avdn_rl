@@ -350,6 +350,8 @@ def main():
     if args.train_val_on_full:
         args.max_action_len *= 4
     if args.world_size > 1:
+        if args.local_rank == -1 and os.environ.get("LOCAL_RANK", "") != "":
+            args.local_rank = int(os.environ["LOCAL_RANK"])
         rank = init_distributed(args)
         torch.cuda.set_device(args.local_rank)
     else:
