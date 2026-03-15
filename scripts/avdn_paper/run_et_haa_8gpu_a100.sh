@@ -7,6 +7,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-output/et_stop_8gpu}"
 GPUS="${GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SEED="${SEED:-0}"
+DEBUG_CUDA="${DEBUG_CUDA:-0}"
+LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/launcher_logs}"
 
 # Training schedule
 ITERS="${ITERS:-300000}"
@@ -55,6 +57,17 @@ DARKNET_CFG="${DARKNET_CFG:-${ROOT_DIR}/AVDN/pretrain_weights/yolo_v3.cfg}"
 DARKNET_WEIGHT="${DARKNET_WEIGHT:-${ROOT_DIR}/AVDN/pretrain_weights/best.pt}"
 
 mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${LOG_DIR}"
+
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_DIR}/train_${TIMESTAMP}.log"
+
+if [[ "${DEBUG_CUDA}" == "1" ]]; then
+  export CUDA_LAUNCH_BLOCKING=1
+  export TORCH_DISTRIBUTED_DEBUG=DETAIL
+  export NCCL_DEBUG=WARN
+  echo "Debug mode enabled: CUDA_LAUNCH_BLOCKING=1 TORCH_DISTRIBUTED_DEBUG=DETAIL NCCL_DEBUG=WARN"
+fi
 
 ARGS=(
   --root_dir "${ROOT_DIR}"
@@ -104,10 +117,30 @@ echo "Launching 8-GPU training from ${REPO_DIR}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Root dir: ${ROOT_DIR}"
 echo "Use PPO: ${USE_PPO}"
+echo "Log file: ${LOG_FILE}"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \
-torchrun \
-  --standalone \
-  --nproc_per_node="${GPUS}" \
-  --master_port="${MASTER_PORT}" \
-  src/xview_et/main.py "${ARGS[@]}"
+{
+  echo "========== Launch Info =========="
+  date
+  echo "REPO_DIR=${REPO_DIR}"
+  echo "ROOT_DIR=${ROOT_DIR}"
+  echo "OUTPUT_DIR=${OUTPUT_DIR}"
+  echo "LOG_DIR=${LOG_DIR}"
+  echo "GPUS=${GPUS}"
+  echo "MASTER_PORT=${MASTER_PORT}"
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+  echo "USE_PPO=${USE_PPO}"
+  echo "DEBUG_CUDA=${DEBUG_CUDA}"
+  echo "========== Command =========="
+  printf '%q ' torchrun --standalone --nproc_per_node="${GPUS}" --master_port="${MASTER_PORT}" src/xview_et/main.py "${ARGS[@]}"
+  echo
+  echo "=============================="
+
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" \
+  PYTHONUNBUFFERED=1 \
+  torchrun \
+    --standalone \
+    --nproc_per_node="${GPUS}" \
+    --master_port="${MASTER_PORT}" \
+    src/xview_et/main.py "${ARGS[@]}"
+} 2>&1 | tee "${LOG_FILE}"
