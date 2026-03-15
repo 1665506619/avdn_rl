@@ -12,6 +12,10 @@ def set_random_seed(seed):
 def length2mask(length, size=None):
     batch_size = len(length)
     size = int(max(length)) if size is None else size
-    mask = (torch.arange(size, dtype=torch.int64).unsqueeze(0).repeat(batch_size, 1)
-                > (torch.LongTensor(length) - 1).unsqueeze(1)).cuda()
+    device = length.device if isinstance(length, torch.Tensor) else torch.device('cpu')
+    length_tensor = length if isinstance(length, torch.Tensor) else torch.tensor(length, dtype=torch.int64, device=device)
+    mask = (
+        torch.arange(size, dtype=torch.int64, device=device).unsqueeze(0).repeat(batch_size, 1)
+        > (length_tensor.long() - 1).unsqueeze(1)
+    )
     return mask

@@ -18,6 +18,7 @@ class EncoderVL(nn.Module):
             args.encoder_heads,
             args.demb,
             args.dropout_transformer_encoder,
+            batch_first=True,
         )
         self.enc_transformer = nn.TransformerEncoder(encoder_layer, args.encoder_layers)
 
@@ -65,7 +66,7 @@ class EncoderVL(nn.Module):
         )
 
         # encode the inputs
-        output = self.enc_transformer(emb_all.transpose(0, 1), mask_attn, mask_pad).transpose(0, 1)
+        output = self.enc_transformer(emb_all, mask_attn, mask_pad)
         return output, mask_pad
 
     def encode_inputs(self, emb_lang, emb_frames, emb_directions, lengths_lang, mask_pad):

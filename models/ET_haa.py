@@ -124,6 +124,7 @@ class ET(nn.Module):
         """
         forward the model for multiple time-steps (used for training)
         """
+        include_action_std = inputs.get("include_action_std", False)
         # embed language
         output = {}
         emb_lang = inputs["lang"]
@@ -191,8 +192,9 @@ class ET(nn.Module):
             "progress": action[:, 3],
             "stop_logit": stop_logit,
             "state_value": state_value,
-            "action_log_std": self.action_log_std,
         })
+        if include_action_std:
+            output["action_log_std"] = self.action_log_std
 
         return output, pred_saliency
 

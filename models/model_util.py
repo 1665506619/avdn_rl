@@ -205,20 +205,21 @@ def triangular_mask(size, device, diagonal_shift=1):
     """
     generate upper triangular matrix filled with ones
     """
-    square = torch.triu(torch.ones(size, size, device=device), diagonal=diagonal_shift)
-    square = square.masked_fill(square == 1.0, float("-inf"))
-    return square
+    return torch.triu(
+        torch.ones(size, size, device=device, dtype=torch.bool),
+        diagonal=diagonal_shift,
+    )
 
 
 def generate_attention_mask(len_lang, len_frames, device, num_input_actions=0):
     """
     generate mask for attention (a timestep at t does not attend to timesteps after t)"""
     # 1. language should attend only to language
-    lang_to_lang = torch.zeros((len_lang, len_lang), device=device).float()
-    lang_to_rest = torch.ones((len_lang, len_frames * 2), device=device).float() * float("-inf")
+    lang_to_lang = torch.zeros((len_lang, len_lang), device=device, dtype=torch.bool)
+    lang_to_rest = torch.ones((len_lang, len_frames * 2), device=device, dtype=torch.bool)
     lang_to_all = torch.cat((lang_to_lang, lang_to_rest), dim=1)
     # 2.1 frames should attend to all language tokens
-    frames_to_lang = torch.zeros((len_frames, len_lang), device=device).float()
+    frames_to_lang = torch.zeros((len_frames, len_lang), device=device, dtype=torch.bool)
     # 2.2 frames should attend to frames with timestep <= t
     frames_to_frames = triangular_mask(len_frames, device)
     # 2.3 frames should attend to directions with timestep <= t

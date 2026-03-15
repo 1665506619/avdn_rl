@@ -2,7 +2,7 @@ import os
 import sys
 import math
 import random
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from collections import defaultdict
 
 import cv2
@@ -109,6 +109,7 @@ class NavigationModel(nn.Module):
                 lenths=kwargs['lenths'],
                 lang=kwargs['lang'],
                 lang_cls=kwargs['lang_cls'],
+                include_action_std=kwargs.get('include_action_std', False),
             )
         raise ValueError(f'Unsupported navigation mode: {mode}')
 
@@ -139,13 +140,15 @@ class NavCMTAgent:
         self.img_tensor = transforms.ToTensor()
         self.model = NavigationModel(self.args).to(self.device)
         new_state = torch.load(self.args.darknet_weight_file, map_location='cpu')
-        state = self._module().vision_model.state_dict()
+        state = self._submodule('vision_model').state_dict()
         model_keys = set(state.keys())
         state_dict = {k: v for k, v in new_state['model'].items() if k in model_keys}
         state.update(state_dict)
-        self._module().vision_model.load_state_dict(state)
+        self._submodule('vision_model').load_state_dict(state)
         self._maybe_wrap_ddp()
-        model_module = self._module()
+        lang_model = self._submodule('lang_model')
+        vision_model = self._submodule('vision_model')
+        vln_model = self._submodule('vln_model')
 
         optimizer_map = {
             'adam': torch.optim.Adam,
@@ -154,10 +157,10 @@ class NavCMTAgent:
             'sgd': torch.optim.SGD,
         }
         optimizer_cls = optimizer_map[args.optim]
-        self.et_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vln_model.parameters()), lr=args.lr)
-        self.lang_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.lang_model.parameters()), lr=args.lr)
-        self.vision_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vision_model.parameters()), lr=args.lr)
-        self.rl_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, model_module.vln_model.parameters()), lr=args.rl_lr)
+        self.et_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, vln_model.parameters()), lr=args.lr)
+        self.lang_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, lang_model.parameters()), lr=args.lr)
+        self.vision_model_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, vision_model.parameters()), lr=args.lr)
+        self.rl_optimizer = optimizer_cls(filter(lambda p: p.requires_grad, vln_model.parameters()), lr=args.rl_lr)
 
         self.progress_regression = nn.MSELoss(reduction='sum')
         self.stop_criterion = nn.BCEWithLogitsLoss(reduction='sum')
@@ -174,24 +177,35 @@ class NavCMTAgent:
             'find_unused_parameters': True,
             'broadcast_buffers': False,
         }
-        self.model = DDP(self.model, **ddp_kwargs)
+        for module_name in ('lang_model', 'vision_model', 'vln_model'):
+            wrapped_module = DDP(getattr(self.model, module_name), **ddp_kwargs)
+            if hasattr(wrapped_module, '_set_static_graph'):
+                wrapped_module._set_static_graph()
+            setattr(self.model, module_name, wrapped_module)
 
     def _unwrap(self, model):
         return model.module if isinstance(model, DDP) else model
 
     def _module(self):
-        return self._unwrap(self.model)
+        return self.model
+
+    def _submodule(self, module_name):
+        return self._unwrap(getattr(self.model, module_name))
 
     def _set_requires_grad(self, module_names, requires_grad):
-        model_module = self._module()
         for module_name in module_names:
-            for param in getattr(model_module, module_name).parameters():
+            for param in self._submodule(module_name).parameters():
                 param.requires_grad_(requires_grad)
 
     def _ddp_no_sync(self):
-        if isinstance(self.model, DDP):
-            return self.model.no_sync()
-        return nullcontext()
+        stack = ExitStack()
+        active = False
+        for module_name in ('lang_model', 'vision_model', 'vln_model'):
+            module = getattr(self.model, module_name)
+            if isinstance(module, DDP):
+                stack.enter_context(module.no_sync())
+                active = True
+        return stack if active else nullcontext()
 
     def get_results(self):
         return self.results
@@ -243,7 +257,7 @@ class NavCMTAgent:
                 else:
                     raise ValueError('Unsupported feedback mode: %s' % feedback)
 
-                torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 40.)
+                torch.nn.utils.clip_grad_norm_(self._submodule('vln_model').parameters(), 40.)
                 self.lang_model_optimizer.step()
                 self.vision_model_optimizer.step()
                 self.et_optimizer.step()
@@ -513,7 +527,7 @@ class NavCMTAgent:
                 rollout_inputs['lenths'][i] += 1
         return rollout_inputs
 
-    def forward_navigation(self, rollout_inputs):
+    def forward_navigation(self, rollout_inputs, include_action_std=False):
         model_out, pred_saliency = self.model(
             mode='navigation',
             directions=rollout_inputs['directions'],
@@ -521,9 +535,10 @@ class NavCMTAgent:
             lenths=rollout_inputs['lenths'],
             lang=rollout_inputs['lang'],
             lang_cls=rollout_inputs['lang_cls'],
+            include_action_std=include_action_std,
         )
         action = model_out['action']
-        return {
+        pred_dict = {
             'action': action,
             'pred_next_pos_ratio': action[:, :2],
             'pred_altitude': action[:, 2],
@@ -531,8 +546,10 @@ class NavCMTAgent:
             'stop_logit': model_out['stop_logit'],
             'stop_prob': torch.sigmoid(model_out['stop_logit']),
             'state_value': model_out['state_value'],
-            'action_log_std': model_out['action_log_std'],
-        }, pred_saliency
+        }
+        if include_action_std:
+            pred_dict['action_log_std'] = model_out['action_log_std']
+        return pred_dict, pred_saliency
 
     def normalize_waypoint(self, waypoint):
         waypoint = np.array(waypoint, dtype=np.float32, copy=True)
@@ -676,6 +693,7 @@ class NavCMTAgent:
             lenths=transition['lenths'],
             lang=transition['lang'].to(self.device),
             lang_cls=transition['lang_cls'].to(self.device),
+            include_action_std=True,
         )
         action = model_out['action']
         action_mean = torch.cat((action[:, :2], action[:, 2:3]), dim=1)
@@ -853,7 +871,7 @@ class NavCMTAgent:
             for t in range(self.args.max_action_len):
                 im_feature = self.extract_visual_features(obs).detach()
                 rollout_inputs = self.append_step_inputs(rollout_inputs, im_feature, direction_t, ended)
-                pred_dict, _ = self.forward_navigation(rollout_inputs)
+                pred_dict, _ = self.forward_navigation(rollout_inputs, include_action_std=True)
 
                 action_mean = torch.cat((pred_dict['pred_next_pos_ratio'], pred_dict['pred_altitude'].unsqueeze(1)), dim=1)
                 action_std = pred_dict['action_log_std'].exp().unsqueeze(0).expand_as(action_mean)
@@ -962,7 +980,7 @@ class NavCMTAgent:
 
                 total_loss = total_loss / max(len(batch_idx), 1)
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 10.)
+                torch.nn.utils.clip_grad_norm_(self._submodule('vln_model').parameters(), 10.)
                 self.rl_optimizer.step()
 
                 stats['ppo_loss'].append(float(total_loss.detach().item()))
@@ -985,7 +1003,7 @@ class NavCMTAgent:
         try:
             self.rollout(train_ml=self.args.ppo_il_w, train_rl=False, nss_w=0)
             self.loss.backward()
-            torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 10.)
+            torch.nn.utils.clip_grad_norm_(self._submodule('vln_model').parameters(), 10.)
             self.rl_optimizer.step()
         finally:
             self._set_requires_grad(('lang_model', 'vision_model'), True)
@@ -998,8 +1016,6 @@ class NavCMTAgent:
         the_dir, _ = os.path.split(path)
         os.makedirs(the_dir, exist_ok=True)
         states = {}
-        model_module = self._module()
-
         def create_state(name, model, optimizer):
             states[name] = {
                 'epoch': epoch + 1,
@@ -1007,15 +1023,14 @@ class NavCMTAgent:
                 'optimizer': optimizer.state_dict(),
             }
 
-        create_state('lang_model', model_module.lang_model, self.lang_model_optimizer)
-        create_state('vision_model', model_module.vision_model, self.vision_model_optimizer)
-        create_state('vln_model', model_module.vln_model, self.et_optimizer)
+        create_state('lang_model', self._submodule('lang_model'), self.lang_model_optimizer)
+        create_state('vision_model', self._submodule('vision_model'), self.vision_model_optimizer)
+        create_state('vln_model', self._submodule('vln_model'), self.et_optimizer)
         states['rl_optimizer'] = {'epoch': epoch + 1, 'optimizer': self.rl_optimizer.state_dict()}
         torch.save(states, path)
 
     def load(self, path):
         states = torch.load(path, map_location='cpu')
-        model_module = self._module()
 
         def recover_state(name, model, optimizer):
             state = model.state_dict()
@@ -1036,9 +1051,9 @@ class NavCMTAgent:
             count_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print('Model parameters: ', count_parameters)
 
-        recover_state('lang_model', model_module.lang_model, self.lang_model_optimizer)
-        recover_state('vision_model', model_module.vision_model, self.vision_model_optimizer)
-        recover_state('vln_model', model_module.vln_model, self.et_optimizer)
+        recover_state('lang_model', self._submodule('lang_model'), self.lang_model_optimizer)
+        recover_state('vision_model', self._submodule('vision_model'), self.vision_model_optimizer)
+        recover_state('vln_model', self._submodule('vln_model'), self.et_optimizer)
 
         if self.args.resume_optimizer and 'rl_optimizer' in states and 'optimizer' in states['rl_optimizer']:
             self.rl_optimizer.load_state_dict(states['rl_optimizer']['optimizer'])
