@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import random
+from contextlib import nullcontext
 from collections import defaultdict
 
 import cv2
@@ -187,6 +188,11 @@ class NavCMTAgent:
             for param in getattr(model_module, module_name).parameters():
                 param.requires_grad_(requires_grad)
 
+    def _ddp_no_sync(self):
+        if isinstance(self.model, DDP):
+            return self.model.no_sync()
+        return nullcontext()
+
     def get_results(self):
         return self.results
 
@@ -218,16 +224,25 @@ class NavCMTAgent:
 
                 if feedback == 'teacher':
                     self.feedback = 'teacher'
+                    self.loss = 0
                     self.rollout(train_ml=self.args.teacher_weight, train_rl=False, nss_w=self.args.nss_w * nss_w_weighting, **kwargs)
+                    self.loss.backward()
                 elif feedback == 'student':
                     self.feedback = 'teacher'
-                    self.rollout(train_ml=self.args.ml_weight, train_rl=False, nss_w=0, **kwargs)
+                    with self._ddp_no_sync():
+                        self.loss = 0
+                        self.rollout(train_ml=self.args.ml_weight, train_rl=False, nss_w=0, **kwargs)
+                        teacher_loss = self.loss
+                        teacher_loss.backward()
                     self.feedback = 'student'
+                    self.loss = 0
                     self.rollout(train_ml=self.args.ml_weight, train_rl=False, nss_w=self.args.nss_w * nss_w_weighting, **kwargs)
+                    student_loss = self.loss
+                    student_loss.backward()
+                    self.loss = teacher_loss.detach() + student_loss.detach()
                 else:
                     raise ValueError('Unsupported feedback mode: %s' % feedback)
 
-                self.loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._module().vln_model.parameters(), 40.)
                 self.lang_model_optimizer.step()
                 self.vision_model_optimizer.step()
